@@ -3,6 +3,7 @@ from jax import vmap
 from jax_md import space, partition
 import numpy as np
 
+
 def opls_aa_energy(
     bonds, angles, torsions, impropers,
     nonbonded,
@@ -94,7 +95,6 @@ def opls_aa_energy(
         # Apply cutoff
         r_cut = 15.0
         mask = r < r_cut
-        print(mask)
         # Filter values based on the cutoff
         r = r[mask]
         pi = pi[mask]
@@ -118,9 +118,9 @@ def opls_aa_energy(
     return energy_fn
 
 
-def opls_aa_energy_with_nlist(
+def opls_aa_energy_with_nlist_modular(
     bonds, angles, torsions, impropers,
-    nonbonded, box, r_cut=15.0, dr_threshold=0.5
+    nonbonded, box, coulomb_handler, r_cut=15.0, dr_threshold=0.5
 ):
     bond_idx, k_b, r0 = bonds
     angle_idx, k_theta, theta0 = angles
@@ -203,7 +203,9 @@ def opls_aa_energy_with_nlist(
 
         # 1–4 pair lookup
         is_14_table = make_is_14_lookup(pair_indices, is_14_mask, num_atoms)
-
+        #computes total coulomb energy of the system at once (more efficient than inside the pair loop below)
+        #coulomb_energy=coulomb_handler.energy(positions, charges, displacement_fn, exclusion_mask, is_14_table) #for Cut-Off method
+        coulomb_energy=coulomb_handler.energy(positions, charges, displacement_fn, exclusion_mask, is_14_table,box) #for Ewald summation
         def compute_pair_energy(i, j):
             same_atom = (i == j)
             excluded = exclusion_mask[i, j]
@@ -213,13 +215,11 @@ def opls_aa_energy_with_nlist(
             sigma_ij = jnp.sqrt(sigmas[i] * sigmas[j])
             epsilon_ij = jnp.sqrt(epsilons[i] * epsilons[j])
             lj = 4 * epsilon_ij * ((sigma_ij / r) ** 12 - (sigma_ij / r) ** 6)
-            coulomb = 332.06371 * (charges[i] * charges[j]) / r
-
             is_14 = is_14_table[i, j]
             scale_lj = jnp.where(is_14, 0.5, 1.0)
-            scale_coulomb = jnp.where(is_14, 0.5, 1.0)
-
-            energy = scale_lj * lj + scale_coulomb * coulomb
+            
+            #coulomb_energy=coulomb_handler.energy(positions, charges, displacement_fn, exclusion_mask, is_14_table)
+            energy = scale_lj * lj 
             include = (~same_atom) & (~excluded) & (r < r_cut)
             return jnp.where(include, energy, 0.0)
 
@@ -229,7 +229,6 @@ def opls_aa_energy_with_nlist(
 
         E_nb = 0.5 * jnp.sum(vmap(sum_over_neighbors)(jnp.arange(num_atoms)))
 
-        return E_bond + E_angle + E_torsion + E_improper + E_nb
+        return E_bond + E_angle + E_torsion + E_improper + E_nb + coulomb_energy
 
     return energy_fn
-

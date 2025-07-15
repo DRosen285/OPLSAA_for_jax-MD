@@ -4,7 +4,7 @@ from jax_md import space
 from jax_md import util
 from energy_oplsaa import opls_aa_energy, opls_aa_energy_with_nlist_modular
 from run_oplsaa_energy import parse_lammps_data
-from modular_Ewald import CutoffCoulomb, EwaldCoulomb
+from modular_Ewald import CutoffCoulomb, EwaldCoulomb, PME_Coulomb
 
 
 
@@ -21,7 +21,9 @@ if __name__ == '__main__':
     )
 
     #coulomb_handler = CutoffCoulomb(r_cut=15.0, use_erfc=False, alpha=0.3)
-    coulomb_handler = EwaldCoulomb(alpha=0.3, kmax=5, r_cut=15.0)
+    coulomb_handler = EwaldCoulomb(alpha=0, kmax=5, r_cut=15.0) #to reproduce lammps energy use alpha=0
+
+    coulomb_handler = PME_Coulomb(grid_size=32, alpha=0.1)
 
 
     energy_fn_nlist_modular = opls_aa_energy_with_nlist_modular(

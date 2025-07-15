@@ -205,7 +205,7 @@ def opls_aa_energy_with_nlist_modular(
         is_14_table = make_is_14_lookup(pair_indices, is_14_mask, num_atoms)
         #computes total coulomb energy of the system at once (more efficient than inside the pair loop below)
         #coulomb_energy=coulomb_handler.energy(positions, charges, displacement_fn, exclusion_mask, is_14_table) #for Cut-Off method
-        coulomb_energy=coulomb_handler.energy(positions, charges, displacement_fn, exclusion_mask, is_14_table,box) #for Ewald summation
+        coulomb_energy=coulomb_handler.energy(positions, charges, displacement_fn, exclusion_mask, is_14_table,box) #for Ewald summation/real PME
         def compute_pair_energy(i, j):
             same_atom = (i == j)
             excluded = exclusion_mask[i, j]

@@ -81,7 +81,7 @@ class EwaldCoulomb(CoulombHandler):
             return (4 * jnp.pi / vol) * factor * jnp.abs(rho_k) ** 2
 
         energy_terms = vmap(compute_term)(kvecs)
-        return 0.5 * jnp.sum(energy_terms)
+        return 0.5 * jnp.sum(energy_terms) *self.prefactor
 
     def self_energy(self, charges):
         return -self.alpha / jnp.sqrt(jnp.pi) * jnp.sum(charges ** 2) * self.prefactor

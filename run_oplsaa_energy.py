@@ -69,6 +69,7 @@ def parse_lammps_data(data_path, settings_path):
     positions = np.zeros((num_atoms, 3))
     charges = np.zeros((num_atoms,))
     types = np.zeros((num_atoms,), dtype=int)
+    molecule_id = np.zeros((num_atoms,))
 
     for i, line in enumerate(data['Atoms']):
         parts = line.split()
@@ -76,6 +77,7 @@ def parse_lammps_data(data_path, settings_path):
         positions[i] = [x, y, z]
         charges[i] = q
         types[i] = typ
+        molecule_id[i] = mol
 
     sigmas = sig_by_type[types - 1]
     epsilons = eps_by_type[types - 1]
@@ -140,6 +142,6 @@ def parse_lammps_data(data_path, settings_path):
         (jnp.array(torsion_idx), jnp.array(k_torsion), jnp.array(d_torsion), jnp.array(n_torsion), jnp.array(gamma_torsion)),
         (jnp.array(improper_idx), jnp.array(k_improper), jnp.array(d_improper), jnp.array(n_improper), jnp.array(gamma_improper)),
         (jnp.array(charges), jnp.array(sigmas), jnp.array(epsilons), jnp.array(pair_indices), is_14_mask),
-        box
+        jnp.array(molecule_id),box
     )
 

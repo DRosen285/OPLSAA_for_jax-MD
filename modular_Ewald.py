@@ -95,7 +95,7 @@ class EwaldCoulomb(CoulombHandler):
         idx_j = nlist.idx  # (N, M)
 
     # Valid neighbor entries
-        valid = idx_j >= 0
+        valid = (idx_j >=0) & (idx_j < num_atoms)
         ri = positions[idx_i]  # (N, M, 3)
         rj = positions[idx_j]  # (N, M, 3)
 
@@ -105,6 +105,7 @@ class EwaldCoulomb(CoulombHandler):
         batched_displacement = jax.vmap(jax.vmap(displacement_fn, in_axes=(0, 0)), in_axes=(0, 0))
         disp = batched_displacement(ri, rj)
         r = jnp.linalg.norm(disp, axis=-1)  # (N, M)
+        r_safe = jnp.where(r < 1e-6, 1e-6, r)
 
         same = idx_i == idx_j  # (N, M)
         excluded = exclusion_mask[idx_i, idx_j]
@@ -113,22 +114,24 @@ class EwaldCoulomb(CoulombHandler):
 
     # Include only valid, non-self, within cutoff
         include = valid & (~same) & r_lt_cut
-
     # Coulomb scaling: 0.5 for 1-4, 1.0 otherwise, 0.0 if excluded
         factor_coul = jnp.where(is_14, 0.5, 1.0)
         factor_coul = jnp.where(excluded, 0.0, factor_coul)
-
     # Erfc term
-        erfc_val = self.lammps_erfc(self.alpha * r)
+        erfc_val = self.lammps_erfc(self.alpha * r_safe)
 
     # Energy expression
-        energy_raw = self.prefactor * qi * qj / r * (erfc_val - (1.0 - factor_coul))
+        energy_raw = self.prefactor * qi * qj / r_safe * (erfc_val - (1.0 - factor_coul))
+
+        #energy_raw = self.prefactor * qi * qj / r_safe * erfc_val
+
         energy = jnp.where(include, energy_raw, 0.0)
 
         total_energy = jnp.sum(energy) * 0.5
         return total_energy
 
-    def energy(self, positions, charges, displacement_fn, exclusion_mask, is_14_table, box,nlist):
+
+    def energy(self, positions, charges, displacement_fn, exclusion_mask, is_14_table, box,nlist,):
         e_real = self.real_energy(positions, charges, displacement_fn, exclusion_mask, is_14_table,nlist)
         e_recip = self.reciprocal_energy(positions, charges, box)
         e_self = self.self_energy(charges)
@@ -195,7 +198,7 @@ class PME_Coulomb:
         idx_j = nlist.idx  # (N, M)
 
     # Valid neighbor entries
-        valid = idx_j >= 0
+        valid = (idx_j >=0) & (idx_j < num_atoms)
         ri = positions[idx_i]  # (N, M, 3)
         rj = positions[idx_j]  # (N, M, 3)
 
@@ -205,11 +208,12 @@ class PME_Coulomb:
         batched_displacement = jax.vmap(jax.vmap(displacement_fn, in_axes=(0, 0)), in_axes=(0, 0))
         disp = batched_displacement(ri, rj)
         r = jnp.linalg.norm(disp, axis=-1)  # (N, M)
+        r_safe = jnp.where(r < 1e-6, 1e-6, r)# Avoid division by zero
 
         same = idx_i == idx_j  # (N, M)
         excluded = exclusion_mask[idx_i, idx_j]
         is_14 = is_14_table[idx_i, idx_j]
-        r_lt_cut = r < self.r_cut
+        r_lt_cut = r_safe < self.r_cut
 
     # Include only valid, non-self, within cutoff
         include = valid & (~same) & r_lt_cut
@@ -219,10 +223,10 @@ class PME_Coulomb:
         factor_coul = jnp.where(excluded, 0.0, factor_coul)
 
     # Erfc term
-        erfc_val =  jax.scipy.special.erfc(self.alpha * r)  #self.lammps_erfc(self.alpha * r)
+        erfc_val =  jax.scipy.special.erfc(self.alpha * r_safe)  #self.lammps_erfc(self.alpha * r)
 
     # Energy expression
-        energy_raw = self.prefactor * qi * qj / r * (erfc_val - (1.0 - factor_coul))
+        energy_raw = self.prefactor * qi * qj / r_safe * (erfc_val - (1.0 - factor_coul))
         energy = jnp.where(include, energy_raw, 0.0)
 
         total_energy = jnp.sum(energy) * 0.5

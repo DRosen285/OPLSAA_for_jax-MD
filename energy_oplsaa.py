@@ -157,6 +157,6 @@ def optimized_opls_aa_energy_with_nlist_modular(
             return jnp.sum(pair_energies)
             
         E_nb = 0.5 * jnp.sum(vmap(sum_over_neighbors)(jnp.arange(num_atoms)))
-        return  E_nb#E_bond + E_angle + E_torsion + E_improper + E_nb
+        return  E_bond + E_angle + E_torsion + E_improper + E_nb
 
     return bonded_and_lj_energy, neighbor_fn, displacement_fn

@@ -47,7 +47,8 @@ class CutoffCoulomb(CoulombHandler):
         scale = jnp.where(is_14, 0.5, 1.0)
         energy_raw = self.pair_energy(qi, qj, r) * scale
         energy = jnp.where(include, energy_raw, 0.0)
-
+        
+        #use same format for return as in Ewald/PME: e_real=0, e_recip=0, e_self=0 for cutoff method
         return 0.0, 0.0, 0.0, 0.5 * jnp.sum(energy)
  
 

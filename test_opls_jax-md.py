@@ -1,7 +1,7 @@
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax import jit, grad
+from jax import jit, lax, grad
 from scipy.optimize import minimize as scipy_minimize
 
 from jax_md import space,partition
@@ -43,11 +43,6 @@ coulomb_handler = CutoffCoulomb(r_cut=cut_off_radius)
 #coulomb_handler = EwaldCoulomb(alpha=0.23, kmax=5, r_cut=cut_off_radius)
 
 # === Build neighbor list + displacement ===
-bonded_lj_fn_factory_soft, neighbor_fn, displacement_fn = optimized_opls_aa_energy_with_nlist_modular(
-    bonds, angles, torsions, impropers,
-    nonbonded, molecule_id, box_size,
-    use_soft_lj=True, lj_cap=1000.0
-)
 
 bonded_lj_fn_factory_full, _, _ = optimized_opls_aa_energy_with_nlist_modular(
     bonds, angles, torsions, impropers,
@@ -79,42 +74,36 @@ exclusion_mask = exclusion_mask.at[angle_idx_filtered[:, 2], angle_idx_filtered[
 
 # === Energy breakdown functions ===
 
-@jit
-def energy_breakdown_soft(R, nlist):
-    E_bonded_lj = bonded_lj_fn_factory_soft(R,nlist)
-    e_real, e_recip, e_self, E_coulomb = coulomb_handler.energy(R, charges, displacement_fn, exclusion_mask, is_14_table, box_size, nlist)
-    return E_bonded_lj, e_real, e_recip, e_self, E_coulomb, E_bonded_lj + E_coulomb
+def energy_breakdown_full(R, nlist, use_cut_off_only=False, coulomb_handler=None):
+    E_bonded_lj = bonded_lj_fn_factory_full(R, nlist)
 
-#@jit
-def energy_breakdown_full(R, nlist,use_cut_off_only=False):
-    E_bonded_lj = bonded_lj_fn_factory_full(R,nlist)
-    #for cut-off
-    if use_cut_off_only:
-       E_coulomb = coulomb_handler.energy(positions, charges, displacement_fn, exclusion_mask, is_14_table, box)
-       return E_bonded_lj, E_coulomb, E_bonded_lj + E_coulomb
-    else:
-       e_real, e_recip, e_self, E_coulomb = coulomb_handler.energy(R, charges, displacement_fn, exclusion_mask, is_14_table, box_size, nlist)
-       return E_bonded_lj, e_real, e_recip, e_self, E_coulomb, E_bonded_lj + E_coulomb
+    def cutoff_only_branch(_):
+        e_real, e_recip, e_self, E_coulomb = coulomb_handler.energy(R, charges, displacement_fn, exclusion_mask, is_14_table, box_size, nlist)
+        return E_bonded_lj, e_real, e_recip, e_self, E_coulomb, E_bonded_lj + E_coulomb
+
+    def full_ewald_branch(_):
+        e_real, e_recip, e_self, E_coulomb = coulomb_handler.energy(R, charges, displacement_fn, exclusion_mask, is_14_table, box_size, nlist)
+        return E_bonded_lj, e_real, e_recip, e_self, E_coulomb, E_bonded_lj + E_coulomb
+
+    
+    return lax.cond(use_cut_off_only, cutoff_only_branch, full_ewald_branch, operand=None)
+
+
+# JIT compile with static coulomb_handler
+energy_breakdown_full_jit = jit(energy_breakdown_full, static_argnames=["use_cut_off_only", "coulomb_handler"])
 
 
 # === Report energy ===
-nlist_final = neighbor_fn.update(positions, neighbor_fn.allocate(positions))
+nlist_init = neighbor_fn.allocate(positions)
+nlist_init = neighbor_fn.allocate(positions)
+E_bonded_init, e_real_init, e_recip_init, e_self_init, E_coul_init, E_total_init = energy_breakdown_full_jit(positions, nlist_init,
+                                                                                                             use_cut_off_only=True,coulomb_handler=coulomb_handler)
 
-E_bonded_min,E_coul_min, E_total_min = energy_breakdown_full(positions, nlist_final,use_cut_off_only=True)
-
-print("\nAfter Minimization:")
-print(f"Bonded+LJ       : {E_bonded_min:.6f} kcal/mol")
-print(f"Coulomb total   : {E_coul_min:.6f} kcal/mol")
-print(f"Total potential : {E_total_min:.6f} kcal/mol")
-
-
-#E_bonded_min, e_real_min, e_recip_min, e_self_min, E_coul_min, E_total_min = energy_breakdown_full(positions, nlist_final)
-
-#print("\nAfter Minimization:")
-#print(f"Bonded+LJ       : {E_bonded_min:.6f} kcal/mol")
-#print(f"Coulomb_real    : {e_real_min:.6f} kcal/mol")
-#print(f"Coulomb_recip   : {e_recip_min:.6f} kcal/mol")
-#print(f"Coulomb_self    : {e_self_min:.6f} kcal/mol")
-#print(f"Coulomb total   : {E_coul_min:.6f} kcal/mol")
-#print(f"Total potential : {E_total_min:.6f} kcal/mol")
+print("\nEnergy terms:")
+print(f"Bonded+LJ       : {E_bonded_init:.6f} kcal/mol")
+print(f"Coulomb_real    : {e_real_init:.6f} kcal/mol")
+print(f"Coulomb_recip   : {e_recip_init:.6f} kcal/mol")
+print(f"Coulomb_self    : {e_self_init:.6f} kcal/mol")
+print(f"Coulomb total   : {E_coul_init:.6f} kcal/mol")
+print(f"Total potential : {E_total_init:.6f} kcal/mol")
 

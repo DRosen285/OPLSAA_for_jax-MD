@@ -1,13 +1,13 @@
 import jax
 import jax.numpy as jnp
 import jax.scipy
-from jax import vmap
+from jax import vmap, jit
 from jax_md import space
 from jax.numpy.fft import fftn, fftfreq
 import itertools
 
 class CoulombHandler:
-    def energy(self, positions, charges, displacement_fn, exclusion_mask, is_14_table, box):
+    def energy(self, positions, charges, displacement_fn, exclusion_mask, is_14_table, box,nlist):
         raise NotImplementedError
 
 
@@ -23,26 +23,33 @@ class CutoffCoulomb(CoulombHandler):
             return self.prefactor * (qi * qj / r) * jax.scipy.special.erfc(self.alpha * r)
         else:
             return self.prefactor * (qi * qj / r)
+      
 
-    def energy(self, positions, charges, displacement_fn, exclusion_mask, is_14_table, box):
+    def energy(self, positions, charges, displacement_fn, exclusion_mask, is_14_table, box, nlist):
         num_atoms = positions.shape[0]
 
-        def compute_pair_energy(i, j):
-            same = (i == j)
-            excluded = exclusion_mask[i, j]
-            disp = displacement_fn(positions[i], positions[j])
-            r = jnp.linalg.norm(disp)
-            include = (~same) & (~excluded) & (r < self.r_cut)
-            qi, qj = charges[i], charges[j]
-            is_14 = is_14_table[i, j]
-            scale = jnp.where(is_14, 0.5, 1.0)
-            energy = scale * self.pair_energy(qi, qj, r)
-            return jnp.where(include, energy, 0.0)
+        idx_i, idx_j = jnp.meshgrid(jnp.arange(num_atoms), jnp.arange(num_atoms), indexing='ij')
 
-        pairwise_energy = vmap(lambda i: jnp.sum(vmap(lambda j: compute_pair_energy(i, j))(jnp.arange(num_atoms))))(jnp.arange(num_atoms))
-        return 0.5 * jnp.sum(pairwise_energy)
+        ri = jnp.take(positions, idx_i, axis=0)
+        rj = jnp.take(positions, idx_j, axis=0)
+        qi = jnp.take(charges, idx_i, axis=0)
+        qj = jnp.take(charges, idx_j, axis=0)
 
+        disp = vmap(vmap(displacement_fn))(ri, rj)
+        r = jnp.linalg.norm(disp, axis=-1)
 
+        same = idx_i == idx_j
+        excluded = jax.vmap(lambda i_row, j_row: exclusion_mask[i_row, j_row])(idx_i, idx_j)
+        is_14 = jax.vmap(lambda i_row, j_row: is_14_table[i_row, j_row])(idx_i, idx_j)
+
+        include = (~same) & (~excluded) & (r < self.r_cut)
+
+        scale = jnp.where(is_14, 0.5, 1.0)
+        energy_raw = self.pair_energy(qi, qj, r) * scale
+        energy = jnp.where(include, energy_raw, 0.0)
+
+        return 0.0, 0.0, 0.0, 0.5 * jnp.sum(energy)
+ 
 
 class EwaldCoulomb(CoulombHandler):
     def __init__(self, alpha=0.23, kmax=5, r_cut=15.0):
@@ -90,41 +97,46 @@ class EwaldCoulomb(CoulombHandler):
         num_atoms = positions.shape[0]
         max_neighbors = nlist.idx.shape[1]
 
-        # Shape (N, M)
-        idx_i = jnp.repeat(jnp.arange(num_atoms)[:, None], max_neighbors, axis=1)
+        idx_i = jnp.repeat(jnp.arange(num_atoms)[:, None], max_neighbors, axis=1)  # (N, M)
         idx_j = nlist.idx  # (N, M)
 
-    # Valid neighbor entries
-        valid = (idx_j >=0) & (idx_j < num_atoms)
-        ri = positions[idx_i]  # (N, M, 3)
-        rj = positions[idx_j]  # (N, M, 3)
+        # Valid neighbor entries mask
+        valid = (idx_j >= 0) & (idx_j < num_atoms)
 
-        qi = charges[idx_i]  # (N, M)
-        qj = charges[idx_j]  # (N, M)
+        # Replace invalid indices with 0 (safe dummy index)
+        idx_j_safe = jnp.where(valid, idx_j, 0)
+        idx_i_safe = jnp.where(valid, idx_i, 0)
 
+        # JAX-compatible indexing
+        ri = jnp.take(positions, idx_i_safe, axis=0)
+        rj = jnp.take(positions, idx_j_safe, axis=0)
+        qi = jnp.take(charges, idx_i_safe, axis=0)
+        qj = jnp.take(charges, idx_j_safe, axis=0)
+
+        same = idx_i_safe == idx_j_safe
+        excluded = jax.vmap(lambda i_row, j_row: exclusion_mask[i_row, j_row])(idx_i_safe, idx_j_safe)
+        is_14 = jax.vmap(lambda i_row, j_row: is_14_table[i_row, j_row])(idx_i_safe, idx_j_safe)
+
+        # Batched displacement
         batched_displacement = jax.vmap(jax.vmap(displacement_fn, in_axes=(0, 0)), in_axes=(0, 0))
         disp = batched_displacement(ri, rj)
-        r = jnp.linalg.norm(disp, axis=-1)  # (N, M)
+        r = jnp.linalg.norm(disp, axis=-1)
         r_safe = jnp.where(r < 1e-6, 1e-6, r)
 
-        same = idx_i == idx_j  # (N, M)
-        excluded = exclusion_mask[idx_i, idx_j]
-        is_14 = is_14_table[idx_i, idx_j]
         r_lt_cut = r < self.r_cut
 
-    # Include only valid, non-self, within cutoff
+        # Include only valid, non-self, within cutoff
         include = valid & (~same) & r_lt_cut
-    # Coulomb scaling: 0.5 for 1-4, 1.0 otherwise, 0.0 if excluded
+
+        # Coulomb scaling
         factor_coul = jnp.where(is_14, 0.5, 1.0)
         factor_coul = jnp.where(excluded, 0.0, factor_coul)
-    # Erfc term
-        erfc_val = self.lammps_erfc(self.alpha * r_safe)
 
-    # Energy expression
+        # Erfc term
+        erfc_val = jax.scipy.special.erfc(self.alpha * r_safe)
+
+        # Energy expression
         energy_raw = self.prefactor * qi * qj / r_safe * (erfc_val - (1.0 - factor_coul))
-
-        #energy_raw = self.prefactor * qi * qj / r_safe * erfc_val
-
         energy = jnp.where(include, energy_raw, 0.0)
 
         total_energy = jnp.sum(energy) * 0.5
@@ -193,39 +205,45 @@ class PME_Coulomb:
         num_atoms = positions.shape[0]
         max_neighbors = nlist.idx.shape[1]
 
-        # Shape (N, M)
-        idx_i = jnp.repeat(jnp.arange(num_atoms)[:, None], max_neighbors, axis=1)
+        idx_i = jnp.repeat(jnp.arange(num_atoms)[:, None], max_neighbors, axis=1)  # (N, M)
         idx_j = nlist.idx  # (N, M)
 
-    # Valid neighbor entries
-        valid = (idx_j >=0) & (idx_j < num_atoms)
-        ri = positions[idx_i]  # (N, M, 3)
-        rj = positions[idx_j]  # (N, M, 3)
+        # Valid neighbor entries mask
+        valid = (idx_j >= 0) & (idx_j < num_atoms)
 
-        qi = charges[idx_i]  # (N, M)
-        qj = charges[idx_j]  # (N, M)
+        # Replace invalid indices with 0 (safe dummy index)
+        idx_j_safe = jnp.where(valid, idx_j, 0)
+        idx_i_safe = jnp.where(valid, idx_i, 0)
 
+        # JAX-compatible indexing
+        ri = jnp.take(positions, idx_i_safe, axis=0)
+        rj = jnp.take(positions, idx_j_safe, axis=0)
+        qi = jnp.take(charges, idx_i_safe, axis=0)
+        qj = jnp.take(charges, idx_j_safe, axis=0)
+
+        same = idx_i_safe == idx_j_safe
+        excluded = jax.vmap(lambda i_row, j_row: exclusion_mask[i_row, j_row])(idx_i_safe, idx_j_safe)
+        is_14 = jax.vmap(lambda i_row, j_row: is_14_table[i_row, j_row])(idx_i_safe, idx_j_safe)
+
+        # Batched displacement
         batched_displacement = jax.vmap(jax.vmap(displacement_fn, in_axes=(0, 0)), in_axes=(0, 0))
         disp = batched_displacement(ri, rj)
-        r = jnp.linalg.norm(disp, axis=-1)  # (N, M)
-        r_safe = jnp.where(r < 1e-6, 1e-6, r)# Avoid division by zero
+        r = jnp.linalg.norm(disp, axis=-1)
+        r_safe = jnp.where(r < 1e-6, 1e-6, r)
 
-        same = idx_i == idx_j  # (N, M)
-        excluded = exclusion_mask[idx_i, idx_j]
-        is_14 = is_14_table[idx_i, idx_j]
-        r_lt_cut = r_safe < self.r_cut
+        r_lt_cut = r < self.r_cut
 
-    # Include only valid, non-self, within cutoff
+        # Include only valid, non-self, within cutoff
         include = valid & (~same) & r_lt_cut
 
-    # Coulomb scaling: 0.5 for 1-4, 1.0 otherwise, 0.0 if excluded
+        # Coulomb scaling
         factor_coul = jnp.where(is_14, 0.5, 1.0)
         factor_coul = jnp.where(excluded, 0.0, factor_coul)
 
-    # Erfc term
-        erfc_val =  jax.scipy.special.erfc(self.alpha * r_safe)  #self.lammps_erfc(self.alpha * r)
+        # Erfc term
+        erfc_val = jax.scipy.special.erfc(self.alpha * r_safe)
 
-    # Energy expression
+        # Energy expression
         energy_raw = self.prefactor * qi * qj / r_safe * (erfc_val - (1.0 - factor_coul))
         energy = jnp.where(include, energy_raw, 0.0)
 

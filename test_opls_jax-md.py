@@ -38,9 +38,9 @@ neighbor_fn = partition.neighbor_list(displacement_fn, box, r_cutoff=cut_off_rad
 
 # === Coulomb Handler (Choose one) ===
 #compute alpha based on defined precision
-#coulomb_handler = CutoffCoulomb(r_cut=cut_off_radius)
-#coulomb_handler = PME_Coulomb(grid_size=32, alpha=0.23)
-coulomb_handler = EwaldCoulomb(alpha=0.23, kmax=5, r_cut=cut_off_radius)
+coulomb_handler = CutoffCoulomb(r_cut=cut_off_radius)
+#coulomb_handler = PME_Coulomb(grid_size=32, alpha=0.16219451)
+#coulomb_handler = EwaldCoulomb(alpha=0.1540129, kmax=5, r_cut=cut_off_radius)
 
 # === Build neighbor list + displacement ===
 
@@ -74,21 +74,52 @@ exclusion_mask = exclusion_mask.at[angle_idx_filtered[:, 2], angle_idx_filtered[
 
 # === Energy breakdown functions ===
 
+# --- Full breakdown for reporting/debugging ---
 def energy_breakdown_full(R, nlist, coulomb_handler=None):
-    E_bond, E_angle, E_torsion, E_improper, E_nb,E_bonded_lj = bonded_lj_fn_factory_full(R, nlist)
-    e_real, e_recip, e_self, E_coulomb = coulomb_handler.energy(R, charges, displacement_fn, exclusion_mask, is_14_table, box_size, nlist)
-    return E_bond, E_angle, E_torsion, E_improper, E_nb, e_real, e_recip, e_self, E_coulomb, E_bonded_lj + E_coulomb
+    E_bond, E_angle, E_torsion, E_improper, E_nb, E_bonded_lj = bonded_lj_fn_factory_full(R, nlist)
+
+    e_real, e_recip, e_self, E_coulomb = coulomb_handler.energy(
+        R, charges, displacement_fn, exclusion_mask, is_14_table, box_size, nlist
+    )
+
+    E_total = E_bonded_lj + E_coulomb
+
+    return (
+        E_bond,
+        E_angle,
+        E_torsion,
+        E_improper,
+        E_nb,
+        e_real,
+        e_recip,
+        e_self,
+        E_coulomb,
+        E_total,
+    )
+
+# --- Lightweight total energy for MD/gradients ---
+def total_energy_fn(R, nlist, coulomb_handler=None):
+    _, _, _, _, _, E_bonded_lj = bonded_lj_fn_factory_full(R, nlist)
+
+    _, _, _, E_coulomb = coulomb_handler.energy(
+        R, charges, displacement_fn, exclusion_mask, is_14_table, box_size, nlist
+    )
+
+    return E_bonded_lj + E_coulomb
+
 
 
 # JIT compile with static coulomb_handler
 energy_breakdown_full_jit = jit(energy_breakdown_full, static_argnames=["coulomb_handler"])
+energy_full_jit = jit(total_energy_fn, static_argnames=["coulomb_handler"])
 
 
 # === Report energy ===
 nlist_init = neighbor_fn.allocate(positions)
 nlist_init = neighbor_fn.allocate(positions)
-E_bond_init, E_angle_init, E_torsion_init, E_improper_init, E_nb_init, e_real_init, e_recip_init, e_self_init, E_coul_init, E_total_init = energy_breakdown_full_jit(positions, nlist_init,
-                                                                                                             coulomb_handler=coulomb_handler)
+E_bond_init, E_angle_init, E_torsion_init, E_improper_init, E_nb_init, e_real_init, e_recip_init, e_self_init, E_coul_init, E_total_init = energy_breakdown_full_jit(positions, 
+                                                                                                                                                                     nlist_init, coulomb_handler=coulomb_handler)
+E_tot=energy_full_jit(positions, nlist_init, coulomb_handler=coulomb_handler)
 
 print("\nEnergy terms:")
 print(f"Bond            : {E_bond_init:.6f} kcal/mol")
@@ -101,5 +132,6 @@ print(f"Coulomb_recip   : {e_recip_init:.6f} kcal/mol")
 print(f"Coulomb_self    : {e_self_init:.6f} kcal/mol")
 print(f"Coulomb total   : {E_coul_init:.6f} kcal/mol")
 print(f"Total potential : {E_total_init:.6f} kcal/mol")
+print(f"Total potential : {E_tot:.6f} kcal/mol")
 
 

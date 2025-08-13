@@ -150,7 +150,7 @@ class EwaldCoulomb(CoulombHandler):
         return e_real, e_recip, e_self, e_total
 
 
-class PME_Coulomb:
+class PME_Coulomb(CoulombHandler):
     def __init__(self, grid_size=32, alpha=0.3, r_cut=15.0):
         self.grid_size = grid_size
         self.alpha = alpha

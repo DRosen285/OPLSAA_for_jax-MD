@@ -9,7 +9,7 @@ from jax.scipy.special import erfc
 
 
 class CoulombHandler:
-    def energy(self, positions, charges, displacement_fn, exclusion_mask, is_14_table, box,nlist):
+    def energy(self, positions, charges, box, exclusion_mask, is_14_table, nlist):
         raise NotImplementedError
  
 class CutoffCoulomb(CoulombHandler):
@@ -25,7 +25,7 @@ class CutoffCoulomb(CoulombHandler):
         else:
             return self.prefactor * (qi * qj / r)
 
-    def energy(self, positions, charges, displacement_fn, exclusion_mask, is_14_table, box, nlist):
+    def energy(self, positions, charges, box, exclusion_mask, is_14_table, nlist):
         num_atoms = positions.shape[0]
 
         idx_i, idx_j = jnp.meshgrid(jnp.arange(num_atoms), jnp.arange(num_atoms), indexing='ij')
@@ -34,7 +34,8 @@ class CutoffCoulomb(CoulombHandler):
         rj = jnp.take(positions, idx_j, axis=0)
         qi = jnp.take(charges, idx_i, axis=0)
         qj = jnp.take(charges, idx_j, axis=0)
-
+        
+        displacement_fn, shift_fn = space.periodic(box)
         disp = vmap(vmap(displacement_fn))(ri, rj)
 
         # 💡 Apply r² safety BEFORE sqrt to avoid NaNs in gradient
@@ -140,8 +141,9 @@ class EwaldCoulomb(CoulombHandler):
         total_energy = jnp.sum(energy) * 0.5
         return total_energy
 
-    def energy(self, positions, charges, displacement_fn,
-               exclusion_mask, is_14_table, box, nlist):
+    def energy(self, positions, charges, box,
+               exclusion_mask, is_14_table, nlist):
+        displacement_fn, shift_fn = space.periodic(box)
         e_real = self.real_energy(positions, charges, displacement_fn,
                                   exclusion_mask, is_14_table, nlist)
         e_recip = self.reciprocal_energy(positions, charges, box)
@@ -257,11 +259,12 @@ class PME_Coulomb(CoulombHandler):
         return total_energy
 
 
-    def energy(self, positions, charges, displacement_fn, exclusion_mask, is_14_table, box,nlist):
+    def energy(self, positions, charges, box, exclusion_mask, is_14_table,nlist):
         rho_real = self.structure_factor(charges, positions, box)
         rho_k = fftn(rho_real)
         E_recip = self.reciprocal_energy(rho_k, box)
         E_self = self.self_energy(charges)
+        displacement_fn, shift_fn = space.periodic(box)
         E_real = self.real_energy(positions, charges, displacement_fn, exclusion_mask, is_14_table,nlist)
         return E_real , E_recip, E_self, E_real  + E_recip + E_self
 

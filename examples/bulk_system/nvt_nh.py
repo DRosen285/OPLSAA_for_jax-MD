@@ -1,3 +1,4 @@
+#Nose-Hoover thermostat for NVT simulations
 import jax
 import jax.numpy as jnp
 from jax import jit, lax, grad

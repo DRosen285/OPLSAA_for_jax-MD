@@ -7,5 +7,5 @@ Implementation of the OPLS-AA force field in jax-md
 
 3.) modular_Ewald.py: computation of electrostatic interactions either via simple Coulomb equation, Ewald summation, or PME
 
-4.) test_opls_jax-md.py: example how to compute the energy with jax-md using the custom OPLS-AA implementation
+4.) Examples contain test runs to compute energies for a single molecule and tests for working gradients + example MD files for a bulk system (require further benchmarking) 
 

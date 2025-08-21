@@ -7,7 +7,7 @@ from jax_md import space,partition
 from jax_md import util
 
 from energy_oplsaa import optimized_opls_aa_energy_with_nlist_modular
-from run_oplsaa_energy import parse_lammps_data
+from extract_params_oplsaa import parse_lammps_data
 from modular_Ewald import CutoffCoulomb, PME_Coulomb, EwaldCoulomb, make_is_14_lookup
 
 

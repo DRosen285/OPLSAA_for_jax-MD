@@ -6,7 +6,7 @@ import jax.numpy as jnp
 from jax import jit, lax, random
 from jax_md import units, quantity, simulate, space, partition
 from energy_oplsaa import optimized_opls_aa_energy_with_nlist_modular
-from run_oplsaa_multiple_molecules import parse_lammps_data
+from extract_params_oplsaa import parse_lammps_data
 from modular_Ewald import PME_Coulomb, make_is_14_lookup
 from jax_md.util import f64
 

@@ -4,7 +4,7 @@ from jax import jit, lax, grad
 from scipy.optimize import minimize as scipy_minimize
 from jax_md import util, space, partition,minimize
 from energy_oplsaa import optimized_opls_aa_energy_with_nlist_modular
-from run_oplsaa_multiple_molecules import parse_lammps_data
+from extract_params_oplsaa import parse_lammps_data
 from modular_Ewald import CutoffCoulomb, PME_Coulomb, EwaldCoulomb, make_is_14_lookup
 from functools import partial
 import time

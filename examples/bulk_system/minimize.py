@@ -89,8 +89,8 @@ exclusion_mask = exclusion_mask.at[angle_idx_filtered[:, 2], angle_idx_filtered[
 
 # --- Lightweight total energy for MD/gradients ---
 def make_energy_and_grad_fns(bonded_lj_factory, coulomb_handler,
-                             charges, displacement_fn, exclusion_mask,
-                             is_14_table, box_size):
+                             charges, box_size, exclusion_mask,
+                             is_14_table):
     """
     Returns:
       energy_fn(R, nlist) -> scalar energy
@@ -102,7 +102,7 @@ def make_energy_and_grad_fns(bonded_lj_factory, coulomb_handler,
         _, _, _, _, _, E_bonded_lj = bonded_lj_factory(R, nlist)
         # coulomb returns (e_real, e_recip, e_self, total)
         _, _, _, E_coulomb = coulomb_handler.energy(
-            R, charges, displacement_fn, exclusion_mask, is_14_table, box_size, nlist
+            R, charges, box_size, exclusion_mask, is_14_table, nlist
         )
         return E_bonded_lj + E_coulomb
 
@@ -116,12 +116,12 @@ def make_energy_and_grad_fns(bonded_lj_factory, coulomb_handler,
 
 energy_soft_jit, grad_soft_jit = make_energy_and_grad_fns(
     bonded_lj_fn_factory_soft, coulomb_handler,
-    charges, displacement_fn, exclusion_mask, is_14_table, box_size
+    charges, box_size, exclusion_mask, is_14_table
 )
 
 energy_full_jit, grad_full_jit = make_energy_and_grad_fns(
         bonded_lj_fn_factory_full, coulomb_handler,
-        charges, displacement_fn, exclusion_mask, is_14_table, box_size
+        charges, box_size, exclusion_mask, is_14_table
     )
 
 # === Print initial energy ===

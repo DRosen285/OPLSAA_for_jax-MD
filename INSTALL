@@ -1,0 +1,6 @@
+Installation instruction on a gpu cluster via micromamba:
+micromamba env create -n jax_md python=3.12 -c conda-forge
+micromamba activate jax_md
+pip install --upgrade "jax[cuda12]"==0.6.2 
+git clone https://github.com/jax-md/jax-md.git
+pip install -e jax-md

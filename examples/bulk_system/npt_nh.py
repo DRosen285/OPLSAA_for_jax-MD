@@ -1,89 +1,87 @@
 import jax
-# Enable float64 for numerical stability
-jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_enable_x64", False)  # float32 positions/velocities/mass
 
 import jax.numpy as jnp
-from jax import jit, lax, random
-from jax_md import units, quantity, simulate, space, partition
+from jax import jit, lax, random, value_and_grad
+from jax_md import units, quantity, space, partition, simulate
 from energy_oplsaa import optimized_opls_aa_energy_with_nlist_modular
 from extract_params_oplsaa import parse_lammps_data
 from modular_Ewald import PME_Coulomb, make_is_14_lookup
+import numpy as np
+import pandas as pd
+import os
 from jax_md.util import f64
 
 # === Load system ===
-positions, bonds, angles, torsions, impropers, nonbonded, molecule_id, box, masses = parse_lammps_data(
+positions, bonds, angles, torsions, impropers, nonbonded, molecule_id, box, masses, atom_types = parse_lammps_data(
     'system_after_lammps_min.data',
-    'system.settings'
+    'EC.settings'
 )
+
 unit = units.real_unit_system()
 charges, sigmas, epsilons, pair_indices, is_14_mask = nonbonded
 bond_idx, k_b, r0 = bonds
 angle_idx, k_theta, theta0 = angles
-# --- Neighbor list ---
+box_size = box
 cut_off_radius = 15.0
 dR = 0.5
-box_matrix = jnp.diag(box)
-disp_fn_init, shift_fn_init = space.periodic_general(box_matrix,fractional_coordinates=False)
 
+positions = positions.astype(jnp.float32)
+mass = jnp.array(masses).reshape(-1).astype(jnp.float32) * unit['mass']
+
+displacement_fn, shift_fn = space.periodic_general(box, fractional_coordinates=False)
+
+# --- Neighbor list setup ---
 neighbor_fn = partition.neighbor_list(
-    displacement_or_metric=disp_fn_init,
-    box=box_matrix,
-    r_cutoff=cut_off_radius,
+    displacement_fn, box, r_cutoff=cut_off_radius,
     dr_threshold=dR,
     mask=True,
     return_mask=True
 )
-# allocate with the initial box explicitly
-nlist = neighbor_fn.allocate(positions,box=box_matrix)
+nlist_active = neighbor_fn.allocate(positions)
 
-# --- Coulomb handler ---
-coulomb_handler = PME_Coulomb(grid_size=16, alpha=0.16219451)  # reduced grid size for CPU
+# === Coulomb Handler ===
+coulomb_handler = PME_Coulomb(grid_size=32, alpha=0.16219451)
 
-# --- Force field ---
+# === Build force field ===
 bonded_lj_fn_factory_full, _, _ = optimized_opls_aa_energy_with_nlist_modular(
     bonds, angles, torsions, impropers,
-    nonbonded, molecule_id, box,
+    nonbonded, molecule_id, box_size,
     use_soft_lj=False
 )
+
 n_atoms = positions.shape[0]
 is_14_table = make_is_14_lookup(pair_indices, is_14_mask, n_atoms)
 
 # Exclusions
-same_mol_mask = molecule_id[:, None] == molecule_id[None, :]
 exclusion_mask = jnp.zeros((n_atoms, n_atoms), dtype=bool)
-
 bond_same_mol = molecule_id[bond_idx[:, 0]] == molecule_id[bond_idx[:, 1]]
 angle_same_mol = molecule_id[angle_idx[:, 0]] == molecule_id[angle_idx[:, 2]]
-
 bond_idx_filtered = bond_idx[bond_same_mol]
 angle_idx_filtered = angle_idx[angle_same_mol]
-
 exclusion_mask = exclusion_mask.at[bond_idx_filtered[:, 0], bond_idx_filtered[:, 1]].set(True)
 exclusion_mask = exclusion_mask.at[bond_idx_filtered[:, 1], bond_idx_filtered[:, 0]].set(True)
 exclusion_mask = exclusion_mask.at[angle_idx_filtered[:, 0], angle_idx_filtered[:, 2]].set(True)
 exclusion_mask = exclusion_mask.at[angle_idx_filtered[:, 2], angle_idx_filtered[:, 0]].set(True)
 
-# --- Energy function with dynamic box ---
-def make_energy_fn_dynamic_box(bonded_lj_factory, coulomb_handler, charges, exclusion_mask, is_14_table):
+# === Energy functions ===
+def make_energy_fn(bonded_lj_factory, coulomb_handler,
+                   charges, box_size, exclusion_mask, is_14_table):
     def energy_fn(R, nlist, box, **kwargs):
-        box_matrix = jnp.diag(box)
-        disp_fn, _ = space.periodic_general(box_matrix)
-        *_, E_bonded_lj = bonded_lj_factory(R, nlist)
+        _, _, _, _, _, E_bonded_lj = bonded_lj_factory(R, nlist)
         _, _, _, E_coulomb = coulomb_handler.energy(
-            R, charges, box, exclusion_mask, is_14_table, nlist
+            R, charges, box_size, exclusion_mask, is_14_table, nlist
         )
         return E_bonded_lj + E_coulomb
-    return jax.jit(energy_fn)
+    return jit(energy_fn)
 
-energy_full_jit = make_energy_fn_dynamic_box(
-    bonded_lj_fn_factory_full, coulomb_handler, charges, exclusion_mask, is_14_table
+energy_fn = make_energy_fn(
+    bonded_lj_fn_factory_full, coulomb_handler,
+    charges, box_size, exclusion_mask, is_14_table
 )
+energy_grad_fn = jit(value_and_grad(energy_fn))
 
-print("Initial energy ...")
-energy_init = energy_full_jit(positions, nlist, box)
-print(f"Total initial potential : {energy_init:.6f} kcal/mol")
-
-# --- Stabilized NPT parameters ---
+# --- NPT parameters ---
 dt = 0.5 * unit['time']
 tau_T = 500.0 * unit['time']
 tau_P = 5000.0 * unit['time']
@@ -91,19 +89,17 @@ T_init = 298.0 * unit['temperature']
 P_init = 1.0 * unit['pressure']
 key = random.PRNGKey(121)
 steps = 1000
-mass = jnp.array(masses).reshape(-1) * unit['mass']
 
-# NPT integrator
 from typing import Dict
 def default_nhc_kwargs(tau: f64, overrides: Dict) -> Dict:
     base = {'chain_length': 3, 'chain_steps': 1, 'sy_steps': 1, 'tau': tau}
     return {**base, **(overrides or {})}
 
-new_kwargs = {'chain_length': 3, 'chain_steps': 1, 'sy_steps': 1,}
+new_kwargs = {'chain_length': 3, 'chain_steps': 1, 'sy_steps': 1}
 
 init, apply = simulate.npt_nose_hoover(
-    energy_fn=energy_full_jit,
-    shift_fn=shift_fn_init,
+    energy_fn=energy_fn,
+    shift_fn=shift_fn,
     dt=dt,
     pressure=P_init,
     kT=T_init,
@@ -111,61 +107,76 @@ init, apply = simulate.npt_nose_hoover(
     thermostat_kwargs=default_nhc_kwargs(tau_T, new_kwargs)
 )
 
-state = init(key, positions, nlist=nlist, mass=mass, box=box)
+state = init(key, positions, nlist=nlist_active, mass=mass, box=box)
 
+# --- Output files ---
+trajectory_xyz_file = "trajectory.xyz"
+thermo_file = "thermo.csv"
+for f in [trajectory_xyz_file, thermo_file]:
+    if os.path.exists(f):
+        os.remove(f)
 
-# --- Logging setup ---
-write_every = 100
-log_steps = steps // write_every
-log = {
-    'PE': jnp.zeros((log_steps,)),
-    'KE': jnp.zeros((log_steps,)),
-    'kT': jnp.zeros((log_steps,)),
-    'box': jnp.zeros((log_steps,) + box.shape)
-}
+def save_xyz(frames, atom_types, file_path):
+    with open(file_path, "a") as f:
+        for frame in frames:
+            f.write(f"{len(atom_types)}\n")
+            f.write("Generated by JAX MD simulation\n")
+            for atom_type, pos in zip(atom_types, frame):
+                f.write(f"{atom_type} {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}\n")
 
-# --- CPU-friendly batched stepping ---
-batch_size = 5
-num_batches = steps // batch_size
+# --- Chunked scan parameters ---
+write_every = 10
+nlist_update_steps = 10
+chunk_size = 20  # number of steps per JIT-compiled scan
 
-def make_run_batch(apply_fn, energy_fn, mass, batch_size, write_every):
-    @jit
-    def run_batch(state, nlist, global_step):
-        def body(carry, i):
-            state, nlist = carry
-            state = apply_fn(state, nlist=nlist)
-            nlist = neighbor_fn.update(state.position, nlist)
+thermo_records = []
 
+@jit
+def scan_chunk(carry, _):
+    state, nlist, counter = carry
+
+    def step_fn(carry_inner, _):
+        state_inner, nlist_inner, counter_inner = carry_inner
+
+        # Neighbor list update
+        nlist_inner = lax.cond(counter_inner == 0,
+                               lambda nl: nl.update(state_inner.position),
+                               lambda nl: nl,
+                               nlist_inner)
+        counter_inner = lax.cond(counter_inner == 0,
+                                 lambda _: nlist_update_steps,
+                                 lambda _: counter_inner - 1,
+                                 operand=None)
+        state_inner = apply(state_inner, nlist=nlist_inner)
+        return (state_inner, nlist_inner, counter_inner), None
+
+    carry, _ = lax.scan(step_fn, (state, nlist, counter), None, length=chunk_size)
+    return carry, carry[0].position  # return last positions for logging
+
+# --- Main loop over steps ---
+total_chunks = steps // chunk_size
+counter = nlist_update_steps
+
+for chunk_idx in range(total_chunks):
+    (state, nlist_active, counter), positions_out = scan_chunk((state, nlist_active, counter), None)
+
+    # Stream outputs every write_every steps
+    for step_in_chunk in range(chunk_size):
+        global_step = chunk_idx * chunk_size + step_in_chunk
+        if global_step % write_every == 0:
             mom = state.velocity * mass[:, None]
-            kT = quantity.temperature(momentum=mom, mass=mass[:, None])
+            T = quantity.temperature(momentum=mom, mass=mass[:, None])
             KE = quantity.kinetic_energy(momentum=mom, mass=mass[:, None])
+            PE, _ = energy_grad_fn(state.position, nlist_active, box)
+            thermo_records.append((global_step, float(T), float(KE), float(PE)))
+            save_xyz([np.array(state.position)], atom_types, trajectory_xyz_file)
 
-            do_pe = jnp.equal(jnp.mod(global_step + i, write_every), 0)
-            PE = lax.cond(do_pe, lambda _: energy_fn(state.position, nlist, state.box), lambda _: jnp.nan, operand=None)
+# --- Save thermo ---
+df = pd.DataFrame(thermo_records, columns=["step", "kT", "KE", "PE"])
+df.to_csv(thermo_file, index=False)
 
-            obs = (kT, KE, PE, state.box)
-            return (state, nlist), obs
-
-        xs = jnp.arange(batch_size)
-        (final_state, final_nlist), traj = lax.scan(body, (state, nlist), xs)
-        return final_state, traj
-
-    return run_batch
-
-run_batch_jit = make_run_batch(apply, energy_full_jit, mass, batch_size, write_every)
-
-global_step = 0
-for batch in range(num_batches):
-    state, traj = run_batch_jit(state, nlist, global_step)
-    if (batch + 1) * batch_size % write_every == 0:
-        log_idx = (batch + 1) * batch_size // write_every - 1
-        log['kT'] = log['kT'].at[log_idx].set(traj[0][-1])
-        log['KE'] = log['KE'].at[log_idx].set(traj[1][-1])
-        log['PE'] = log['PE'].at[log_idx].set(traj[2][-1])
-        log['box'] = log['box'].at[log_idx].set(state.box)
-    global_step += batch_size
-
-# --- Final energy ---
-energy_final = energy_full_jit(state.position, nlist, state.box)
-print(f"Total final potential: {energy_final:.6f} kcal/mol")
+R_final = state.position
+E_final, _ = energy_grad_fn(R_final, nlist_active, box)
+print(f"Total final potential : {E_final:.6f} kcal/mol")
+print(f"Trajectory saved to {trajectory_xyz_file}, thermo data saved to {thermo_file}")
 

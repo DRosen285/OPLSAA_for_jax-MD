@@ -137,6 +137,7 @@ def parse_lammps_data(data_path, settings_path):
         (jnp.array(improper_idx), jnp.array(k_improper), jnp.array(d_improper), jnp.array(n_improper), jnp.array(gamma_improper)),
         (jnp.array(charges), jnp.array(sigmas), jnp.array(epsilons), jnp.array(pair_indices), is_14_mask),
         jnp.array(molecule_id), box,
-        jnp.array(masses)  # 🔹 New return value
+        jnp.array(masses),# 🔹 New return value
+        jnp.array(types)
     )
 

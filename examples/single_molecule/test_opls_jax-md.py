@@ -14,7 +14,7 @@ from modular_Ewald import CutoffCoulomb, PME_Coulomb, EwaldCoulomb, make_is_14_l
 
 
 # === Load system ===
-positions, bonds, angles, torsions, impropers, nonbonded, molecule_id, box, masses = parse_lammps_data(
+positions, bonds, angles, torsions, impropers, nonbonded, molecule_id, box, masses, atom_types = parse_lammps_data(
     'EC.data',
     'EC.settings'
 )

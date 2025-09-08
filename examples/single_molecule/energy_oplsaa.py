@@ -155,9 +155,24 @@ def optimized_opls_aa_energy_with_nlist_modular(
             epsilon_ij = jnp.sqrt(epsilons[i] * epsilons[j_clamped])
 
             # LJ calculation
-            sr = sigma_ij / jnp.sqrt(r2_safe)
-            sr6 = sr ** 6
-            lj = 4.0 * epsilon_ij * (sr6 ** 2 - sr6)
+            def lj_energy(r2, r, sigma_ij, epsilon_ij):
+                sr = sigma_ij / jnp.sqrt(r2)
+                sr6 = sr ** 6
+                lj_val = 4.0 * epsilon_ij * (sr6 ** 2 - sr6)
+
+                if use_soft_lj:
+                # Cap energy smoothly
+                  return lj_cap * jnp.tanh(lj_val / lj_cap)
+
+                elif use_shift_lj:
+                # Shift so energy goes to zero at cutoff
+                     sr_cut = sigma_ij / r_cut
+                     sr6_cut = sr_cut ** 6
+                     lj_cut = 4.0 * epsilon_ij * (sr6_cut ** 2 - sr6_cut)
+                     return lj_val - lj_cut
+
+                else:
+                    return lj_val
 
             # Apply scaling
             scale_lj = jnp.where(is_14_table[i, j_clamped], 0.5, 1.0)
@@ -166,8 +181,8 @@ def optimized_opls_aa_energy_with_nlist_modular(
             include = (~same_atom) & (~excluded) & (r < r_cut)
 
             # Apply masking safely
+            lj = lj_energy(r2_safe, r, sigma_ij, epsilon_ij)
             return jnp.where(include, scale_lj * lj, 0.0)
-
 
         def sum_over_neighbors(i):
             neighbors = nlist.idx[i]

@@ -58,21 +58,6 @@ nlist = neighbor_fn.allocate(positions)
 nlist = jax.device_put(nlist, device=device)
 
 # -------------------------
-# Coulomb handler
-# -------------------------
-coulomb_handler = PME_Coulomb(grid_size=32, alpha=0.16219451)
-
-# -------------------------
-# Force field factories
-# -------------------------
-bonded_lj_fn_factory_soft, _, _ = optimized_opls_aa_energy_with_nlist_modular(
-    bonds, angles, torsions, impropers, nonbonded, molecule_id, box, use_soft_lj=True, lj_cap=1000.0
-)
-bonded_lj_fn_factory_full, _, _ = optimized_opls_aa_energy_with_nlist_modular(
-    bonds, angles, torsions, impropers, nonbonded, molecule_id, box, use_soft_lj=False
-)
-
-# -------------------------
 # 1-4 table and exclusions
 # -------------------------
 is_14_table = make_is_14_lookup(pair_indices, is_14_mask, n_atoms)
@@ -92,6 +77,22 @@ exclusion_mask = jax.device_put(exclusion_mask, device=device)
 # -------------------------
 # Energy (NO jit) and its gradient (outside jit)
 # -------------------------
+
+# -------------------------
+# Coulomb handler
+# -------------------------
+coulomb_handler = PME_Coulomb(grid_size=32, alpha=0.16219451)
+
+# -------------------------
+# Force field factories
+# -------------------------
+bonded_lj_fn_factory_soft, _, _ = optimized_opls_aa_energy_with_nlist_modular(
+    bonds, angles, torsions, impropers, nonbonded, molecule_id, box, use_soft_lj=True, lj_cap=1000.0, exclusion_mask=exclusion_mask, is_14_table=is_14_table
+)
+bonded_lj_fn_factory_full, _, _ = optimized_opls_aa_energy_with_nlist_modular(
+    bonds, angles, torsions, impropers, nonbonded, molecule_id, box, use_soft_lj=False, exclusion_mask=exclusion_mask, is_14_table=is_14_table
+)
+
 def energy_soft(R, nlist_local):
     E_bond = bonded_lj_fn_factory_soft(R, nlist_local)[-1]
     E_coul = coulomb_handler.energy(R, charges, box, exclusion_mask, is_14_table, nlist_local)[-1]

@@ -36,16 +36,6 @@ neighbor_fn = partition.neighbor_list(
 nlist_active = neighbor_fn.allocate(positions)
 nlist_next = neighbor_fn.allocate(positions)  # double buffer
 
-# === Coulomb Handler ===
-coulomb_handler = PME_Coulomb(grid_size=32, alpha=0.16219451)
-
-# === Build force field ===
-bonded_lj_fn_factory_full, _, _ = optimized_opls_aa_energy_with_nlist_modular(
-    bonds, angles, torsions, impropers,
-    nonbonded, molecule_id, box_size,
-    use_soft_lj=False
-)
-
 n_atoms = positions.shape[0]
 is_14_table = make_is_14_lookup(pair_indices, is_14_mask, n_atoms)
 
@@ -61,6 +51,16 @@ exclusion_mask = exclusion_mask.at[angle_idx_filtered[:, 0], angle_idx_filtered[
 exclusion_mask = exclusion_mask.at[angle_idx_filtered[:, 2], angle_idx_filtered[:, 0]].set(True)
 
 # === Energy + Grad function ===
+# === Coulomb Handler ===
+coulomb_handler = PME_Coulomb(grid_size=32, alpha=0.16219451)
+
+# === Build force field ===
+bonded_lj_fn_factory_full, _, _ = optimized_opls_aa_energy_with_nlist_modular(
+    bonds, angles, torsions, impropers,
+    nonbonded, molecule_id, box_size,
+    use_soft_lj=False, exclusion_mask=exclusion_mask, is_14_table=is_14_table
+)
+
 def make_energy_and_grad(bonded_lj_factory, coulomb_handler,
                          charges, box_size, exclusion_mask, is_14_table):
     def energy_fn(R, nlist):

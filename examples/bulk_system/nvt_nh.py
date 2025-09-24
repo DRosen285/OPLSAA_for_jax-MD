@@ -5,9 +5,11 @@ from jax_md import units, quantity, space, partition, simulate
 from energy_oplsaa import optimized_opls_aa_energy_with_nlist_modular
 from extract_params_oplsaa import parse_lammps_data
 from modular_Ewald import PME_Coulomb, make_is_14_lookup
+from typing import NamedTuple
 import numpy as np
 import pandas as pd
 import os
+import time
 
 # === Load system ===
 positions, bonds, angles, torsions, impropers, nonbonded, molecule_id, box, masses, atom_types = parse_lammps_data(
@@ -51,26 +53,26 @@ exclusion_mask = exclusion_mask.at[angle_idx_filtered[:, 2], angle_idx_filtered[
 
 # === Energy + Grad function ===
 
-# === Coulomb Handler ===
-coulomb_handler = PME_Coulomb(grid_size=32, alpha=0.16219451)
-
 # === Build force field ===
 bonded_lj_fn_factory_full, _, _ = optimized_opls_aa_energy_with_nlist_modular(
     bonds, angles, torsions, impropers,
     nonbonded, molecule_id, box_size,
-    use_soft_lj=False, exclusion_mask=exclusion_mask, is_14_table=is_14_table
+    use_soft_lj=False,exclusion_mask=exclusion_mask, is_14_table=is_14_table
 )
 
+# === Coulomb Handler ===
+coulomb_handler = PME_Coulomb(grid_size=32, alpha=0.16219451)
 
 def make_energy_and_grad(bonded_lj_factory, coulomb_handler,
                          charges, box_size, exclusion_mask, is_14_table):
     def energy_fn(R, nlist):
+        # everything pure-JAX
         _, _, _, _, _, E_bonded_lj = bonded_lj_factory(R, nlist)
         _, _, _, E_coulomb = coulomb_handler.energy(
             R, charges, box_size, exclusion_mask, is_14_table, nlist
         )
         return E_bonded_lj + E_coulomb
-    return jit(value_and_grad(energy_fn))
+    return jax.jit(jax.value_and_grad(energy_fn))
 
 energy_grad_fn = make_energy_and_grad(
     bonded_lj_fn_factory_full, coulomb_handler,
@@ -81,13 +83,55 @@ print("Initial energy ...")
 E_init, _ = energy_grad_fn(positions, nlist_active)
 print(f"Total initial potential : {E_init:.6f} kcal/mol")
 
+# --- Build topology object for trajectory saving/visualization ---
+import mdtraj as md
+def build_topology(atom_types, molecule_id, bond_idx):
+    """
+    Build MDTraj Topology from parsed system info.
+    """
+    top = md.Topology()
+    chains = {}
+
+    # Ensure molecule_id is a numpy array of ints
+    molecule_id = np.array(molecule_id).astype(int)
+    atom_types = np.array(atom_types)  # optional
+
+    for mol_id in np.unique(molecule_id):
+        chain = top.add_chain()
+        res = top.add_residue(f"MOL{mol_id}", chain)
+        chains[mol_id] = res
+
+    atoms = []
+    for i, (atype, mol_id) in enumerate(zip(atom_types, molecule_id)):
+        mol_id = int(mol_id)  # <-- convert to native Python int
+        # map atom type to MDTraj element if possible
+        if isinstance(atype, str) and len(atype) <= 2:
+            elem = md.element.get_by_symbol(atype)
+        else:
+            elem = md.element.carbon  # fallback
+        atom = top.add_atom(f"{atype}{i}", elem, chains[mol_id])
+        atoms.append(atom)
+
+    # add bonds
+    for i, j in bond_idx:
+        atom_i = int(i)
+        atom_j = int(j)
+        top.add_bond(atoms[atom_i], atoms[atom_j])
+
+    return top
+
+
+
 # === NVT Nose-Hoover setup ===
+nvt_cycles = 5
+nvt_steps = 50
+write_every = 10  # match LAMMPS dump frequency
+
 timestep_fs = 1.0
 dt = timestep_fs * unit['time']
 tau_T=100.0 * unit['time']
 write_every = 100
 T_init = 298 * unit['temperature']
-steps = 1000
 key = random.PRNGKey(121)
 
 mass = jnp.array(masses) * unit['mass']
@@ -101,88 +145,122 @@ init, apply =  simulate.nvt_nose_hoover(
     tau=tau_T,
     mass=mass
 )
+
+# --- Convert arrays to NumPy for writing ---
+n_atoms = positions.shape[0]
+atom_ids = np.arange(1, n_atoms + 1)
+atom_types_np = np.array(atom_types)
+masses_np = np.array(masses)
+
+# --- Open dump file ---
+dump_filename = "dump_EC.lammpstrj"
+dump_file = open(dump_filename, "w")
+
+
+# --- Initial state ---
 state = init(key, positions, nlist=nlist_active)
+current_state = state
+current_box = box
+current_nbrs = nlist_active
 
-# --- Simulation step for scan ---
-nlist_update_steps = 10
+# JIT the integrator functions for speed
+apply = jax.jit(apply)
+init = jax.jit(init)
 
-def scan_step(carry, _):
-    state, nlist_active, nlist_next, counter = carry
+# Initial neighbor object
+nbrs = nlist_active
 
-    # Thermo quantities
-    mom = state.velocity * mass_col
-    T = quantity.temperature(momentum=mom, mass=mass_col)
-    KE = quantity.kinetic_energy(momentum=mom, mass=mass_col)
-    PE, _ = energy_grad_fn(state.position, nlist_active)
+# --- Energy/kinetic functions ---
+kinetic_energy = quantity.kinetic_energy
+temperature_fn = quantity.temperature
 
-    # Neighbor list update
-    nlist_next = lax.cond(
-        counter == 0,
-        lambda nl: nl.update(state.position),
-        lambda nl: nl,
-        nlist_next
+def potential_energy_fn(R, nlist):
+    E, _ = energy_grad_fn(R, nlist)
+    return E
+potential_energy_fn = jax.jit(potential_energy_fn)
+
+# --- Step function for JAX ---
+@jax.jit
+def step_nvt_fn(i, carry):
+    state, nbrs, box, kT = carry
+
+    state = apply(state, nlist=nbrs)
+
+    # Update neighbor list (purely functional)
+    nbrs = neighbor_fn.update(state.position, nbrs)
+
+    return (state, nbrs, box, kT)
+
+
+# --- Main simulation loop ---
+total_time_start = time.time()
+print('Step\tKE\tPE\tTotal Energy\tTemperature\ttime/step (s)')
+print('-----------------------------------------------------------------------------------')
+
+for cycle in range(nvt_cycles):
+    temp_i = T_init
+    old_time = time.time()
+
+    # Run NVT steps in JIT loop
+    carry_init = (current_state, current_nbrs, current_box, temp_i)
+    new_state, new_nbrs, new_box, _ = jax.block_until_ready(
+        jax.lax.fori_loop(0, nvt_steps, step_nvt_fn, carry_init)
     )
-    state = apply(state, nlist=nlist_active)
 
-    # Swap lists if updated
-    nlist_active, nlist_next, counter = lax.cond(
-        counter == 0,
-        lambda _: (nlist_next, nlist_active, nlist_update_steps),
-        lambda _: (nlist_active, nlist_next, counter - 1),
-        operand=None
-    )
+    # Check neighbor overflow
+    if new_nbrs.did_buffer_overflow:
+        print("Neighbor list overflowed, reallocating.")
+        new_nbrs = neighbor_fn.allocate(new_state.position, box=new_box)
 
-    carry = (state, nlist_active, nlist_next, counter)
-    logs = (T, KE, PE, state.position)
-    return carry, logs
+    # Accept new state
+    current_state = new_state
+    current_nbrs = new_nbrs
+    current_box = new_box
 
-# --- Run scan ---
-carry_init = (state, nlist_active, nlist_next, nlist_update_steps)
-(carry_final, logs) = lax.scan(scan_step, carry_init, None, length=steps)
+    # --- Diagnostics ---
+    KE = kinetic_energy(momentum=current_state.momentum, mass=current_state.mass)
+    PE = potential_energy_fn(current_state.position, current_nbrs)
+    T_inst = temperature_fn(momentum=current_state.momentum, mass=current_state.mass) / unit['temperature']
 
-final_state, nlist_active, nlist_next, _ = carry_final
-kT_log, KE_log, PE_log, positions_log = logs
+    steps_done = cycle * nvt_steps
+    time_per_step = (time.time() - old_time) / nvt_steps
 
-# --- Apply thinning ---
-write_mask = jnp.arange(steps) % write_every == 0
-kT_out = np.array(kT_log[write_mask])
-KE_out = np.array(KE_log[write_mask])
-PE_out = np.array(PE_log[write_mask])
-positions_out = np.array(positions_log[write_mask])
+    print(f"{steps_done}\t{KE:.2f}\t{PE:.2f}\t{(KE+PE):.3f}\t{T_inst:.1f}\t{time_per_step:.4f}")
 
-# === Saving ===
-trajectory_xyz_file = "trajectory.xyz"
-thermo_file = "thermo.csv"
+    # --- LAMMPS-style dump ---
+    if steps_done % write_every == 0:
+        f = dump_file
+        f.write(f"ITEM: TIMESTEP\n{steps_done}\n")
+        f.write(f"ITEM: NUMBER OF ATOMS\n{n_atoms}\n")
+        f.write(f"ITEM: BOX BOUNDS pp pp pp\n")
+        # Handle both 1D (orthorhombic) and 2D (triclinic) cases
+        box_arr = np.array(current_box)
 
-for f in [trajectory_xyz_file, thermo_file]:
-    if os.path.exists(f):
-        os.remove(f)
+        if box_arr.ndim == 1:
+        # Orthorhombic: [Lx, Ly, Lz]
+          f.write(f"0 {box_arr[0]}\n")
+          f.write(f"0 {box_arr[1]}\n")
+          f.write(f"0 {box_arr[2]}\n")
+        elif box_arr.ndim == 2:
+        # Triclinic: use diagonal as lengths
+          f.write(f"0 {box_arr[0,0]}\n")
+          f.write(f"0 {box_arr[1,1]}\n")
+          f.write(f"0 {box_arr[2,2]}\n")
+        else:
+          raise ValueError(f"Unexpected box shape: {box_arr.shape}")
 
-def save_xyz(positions_out, atom_types, file_path):
-    with open(file_path, "a") as f:
-        for frame in positions_out:
-            f.write(f"{len(atom_types)}\n")
-            f.write("Generated by JAX MD simulation\n")
-            for atom_type, pos in zip(atom_types, frame):
-                f.write(f"{atom_type} {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}\n")
 
-def save_thermo(kT_out, KE_out, PE_out, write_every, thermo_file):
-    steps_out = np.arange(0, steps, write_every)
-    df = pd.DataFrame({
-        "step": steps_out,
-        "kT": kT_out,
-        "KE": KE_out,
-        "PE": PE_out
-    })
-    df.to_csv(thermo_file, index=False)
+        f.write("ITEM: ATOMS id type mass x y z xu yu zu\n")
 
-# Save all at once
-save_xyz(positions_out, atom_types, trajectory_xyz_file)
-save_thermo(kT_out, KE_out, PE_out, write_every, thermo_file)
+        pos_wrapped = np.array(current_state.position)
+        pos_unwrapped = pos_wrapped  # replace with actual unwrapped if available
 
-# === Final energy ===
-R_final = final_state.position
-E_final, _ = energy_grad_fn(R_final, nlist_active)
-print(f"Total final potential : {E_final:.6f} kcal/mol")
-print(f"Trajectory saved to {trajectory_xyz_file}, thermo data saved to {thermo_file}")
+        for i in range(n_atoms):
+            f.write(f"{atom_ids[i]} {atom_types_np[i]} {masses_np[i]} "
+                    f"{pos_wrapped[i,0]:.6f} {pos_wrapped[i,1]:.6f} {pos_wrapped[i,2]:.6f} "
+                    f"{pos_unwrapped[i,0]:.6f} {pos_unwrapped[i,1]:.6f} {pos_unwrapped[i,2]:.6f}\n")
 
+# --- Close dump file ---
+dump_file.close()
+print("Total simulation time: ", time.time() - total_time_start)
+jax.clear_caches()

@@ -9,6 +9,7 @@ from typing import NamedTuple
 import numpy as np
 import pandas as pd
 import os
+import time
 
 # === Load system ===
 positions, bonds, angles, torsions, impropers, nonbonded, molecule_id, box, masses, atom_types = parse_lammps_data(
@@ -51,15 +52,16 @@ exclusion_mask = exclusion_mask.at[angle_idx_filtered[:, 0], angle_idx_filtered[
 exclusion_mask = exclusion_mask.at[angle_idx_filtered[:, 2], angle_idx_filtered[:, 0]].set(True)
 
 # === Energy + Grad function ===
-# === Coulomb Handler ===
-coulomb_handler = PME_Coulomb(grid_size=32, alpha=0.16219451)
 
 # === Build force field ===
 bonded_lj_fn_factory_full, _, _ = optimized_opls_aa_energy_with_nlist_modular(
     bonds, angles, torsions, impropers,
     nonbonded, molecule_id, box_size,
-    use_soft_lj=False, exclusion_mask=exclusion_mask, is_14_table=is_14_table
+    use_soft_lj=False,exclusion_mask=exclusion_mask, is_14_table=is_14_table
 )
+
+# === Coulomb Handler ===
+coulomb_handler = PME_Coulomb(grid_size=32, alpha=0.16219451)
 
 def make_energy_and_grad(bonded_lj_factory, coulomb_handler,
                          charges, box_size, exclusion_mask, is_14_table):
@@ -81,18 +83,71 @@ print("Initial energy ...")
 E_init, _ = energy_grad_fn(positions, nlist_active)
 print(f"Total initial potential : {E_init:.6f} kcal/mol")
 
+# --- Build topology object for trajectory saving/visualization ---
+import mdtraj as md
+def build_topology(atom_types, molecule_id, bond_idx):
+    """
+    Build MDTraj Topology from parsed system info.
+    """
+    top = md.Topology()
+    chains = {}
+
+    # Ensure molecule_id is a numpy array of ints
+    molecule_id = np.array(molecule_id).astype(int)
+    atom_types = np.array(atom_types)  # optional
+
+    for mol_id in np.unique(molecule_id):
+        chain = top.add_chain()
+        res = top.add_residue(f"MOL{mol_id}", chain)
+        chains[mol_id] = res
+
+    atoms = []
+    for i, (atype, mol_id) in enumerate(zip(atom_types, molecule_id)):
+        mol_id = int(mol_id)  # <-- convert to native Python int
+        # map atom type to MDTraj element if possible
+        if isinstance(atype, str) and len(atype) <= 2:
+            elem = md.element.get_by_symbol(atype)
+        else:
+            elem = md.element.carbon  # fallback
+        atom = top.add_atom(f"{atype}{i}", elem, chains[mol_id])
+        atoms.append(atom)
+
+    # add bonds
+    for i, j in bond_idx:
+        atom_i = int(i)
+        atom_j = int(j)
+        top.add_bond(atoms[atom_i], atoms[atom_j])
+
+    return top
+
+
+
 # --- NVT Langevin setup ---
+# --- Simulation parameters ---
+nvt_cycles = 5
+nvt_steps = 50
+write_every = 10  # match LAMMPS dump frequency
+T_init = 298.0 * unit['temperature']
 timestep_fs = 1.0
 dt = timestep_fs * unit['time']
-tau_damp_fs = 200.0 * unit['time']
+tau_damp_fs = 100.0 * unit['time']
 gamma = 1.0 / tau_damp_fs
-write_every = 100
-T_init = 298 * unit['temperature']
-steps = 1000
 key = random.PRNGKey(121)
 
 mass = jnp.array(masses) * unit['mass']
 mass_col = mass[:, None]
+
+# --- Convert arrays to NumPy for writing ---
+n_atoms = positions.shape[0]
+atom_ids = np.arange(1, n_atoms + 1)
+atom_types_np = np.array(atom_types)
+masses_np = np.array(masses)
+
+# --- Open dump file ---
+dump_filename = "dump_EC.lammpstrj"
+dump_file = open(dump_filename, "w")
+
+# --- Initial state ---
 
 init, apply = simulate.nvt_langevin(
     lambda R, nlist: energy_grad_fn(R, nlist)[0],
@@ -103,139 +158,109 @@ init, apply = simulate.nvt_langevin(
     mass=mass
 )
 state = init(key, positions, nlist=nlist_active)
+current_state = state
+current_box = box
+current_nbrs = nlist_active
 
-# --- Device-side logging layout ---
-n_frames = steps // write_every + 1
+# JIT the integrator functions for speed
+apply = jax.jit(apply)
+init = jax.jit(init)
 
-# Preallocate frame buffer on device
-frames_init = jnp.zeros((n_frames,) + positions.shape, dtype=positions.dtype)
+# Initial neighbor object
+nbrs = nlist_active
 
-# Small counters to avoid modulo in the hot loop
-nlist_update_steps = 10
+# --- Energy/kinetic functions ---
+kinetic_energy = quantity.kinetic_energy
+temperature_fn = quantity.temperature
 
-# One step of the fused simulation.
-def scan_step(carry, i):
-    (state, nlist_act, nlist_nxt,
-     since_update, since_write,
-     frame_idx, frames) = carry
+def potential_energy_fn(R, nlist):
+    E, _ = energy_grad_fn(R, nlist)
+    return E
+potential_energy_fn = jax.jit(potential_energy_fn)
 
-    # Thermo (device-side only)
-    mom = state.velocity * mass_col
-    T = quantity.temperature(momentum=mom, mass=mass_col)
-    KE = quantity.kinetic_energy(momentum=mom, mass=mass_col)
-    PE, _ = energy_grad_fn(state.position, nlist_act)
-
-    # Update neighbor list into the "next" buffer when counter hits 0
-    def do_nlist_update(nl_next):
-        return nl_next.update(state.position)
-    nlist_nxt = lax.cond(since_update == 0, do_nlist_update, lambda x: x, nlist_nxt)
-
-    # Integrate one step using the ACTIVE nlist
-    state = apply(state, nlist=nlist_act)
-
-    # Swap buffers when we just rebuilt
-    def do_swap(_):
-        return (nlist_nxt, nlist_act)
-    def no_swap(_):
-        return (nlist_act, nlist_nxt)
-    nlist_act, nlist_nxt = lax.cond(since_update == 0, do_swap, no_swap, operand=None)
-
-    # Update the counters (wrap without %)
-    since_update = lax.select(since_update == 0,
-                              jnp.int32(nlist_update_steps - 1),
-                              since_update - 1)
-    since_write = lax.select(since_write == 0,
-                             jnp.int32(write_every - 1),
-                             since_write - 1)
-
-    # Conditionally store a frame (device-side) when write counter hits 0
-    def write_frame(frames_frame_idx):
-        fr, idx = frames_frame_idx
-        fr = fr.at[idx].set(state.position)
-        return fr, idx + 1
-    def skip_frame(frames_frame_idx):
-        return frames_frame_idx
-
-    frames, frame_idx = lax.cond(
-        since_write == 0,
-        write_frame,
-        skip_frame,
-        operand=(frames, frame_idx)
-    )
-
-    # Per-step outputs (kept on-device by scan)
-    out = (T, KE, PE)
-
-    carry = (state, nlist_act, nlist_nxt,
-             since_update, since_write,
-             frame_idx, frames)
-    return carry, out
-
-# Wrap the whole trajectory in one JIT
+# --- Step function for JAX ---
 @jax.jit
-def run_simulation(state, nlist_active, nlist_next):
-    # Initialize counters so we write the initial frame and rebuild on step 0
-    since_update0 = jnp.int32(0)
-    since_write0  = jnp.int32(0)
-    frame_idx0    = jnp.int32(0)
-    frames0       = frames_init
+def step_nvt_fn(i, carry):
+    state, nbrs, box, kT = carry
 
-    carry0 = (state, nlist_active, nlist_next,
-              since_update0, since_write0,
-              frame_idx0, frames0)
+    # Langevin step: apply does not take rng
+    state = apply(state, nlist=nbrs, kT=kT)
 
-    # Run fused scan
-    (state_f, nlist_act_f, nlist_nxt_f,
-     _, _, frame_idx_f, frames_f), outs = lax.scan(
-        scan_step, carry0, jnp.arange(steps)
+    # Update neighbor list (purely functional)
+    nbrs = neighbor_fn.update(state.position, nbrs)
+
+    return (state, nbrs, box, kT)
+
+
+# --- Main simulation loop ---
+total_time_start = time.time()
+print('Step\tKE\tPE\tTotal Energy\tTemperature\ttime/step (s)')
+print('-----------------------------------------------------------------------------------')
+
+for cycle in range(nvt_cycles):
+    temp_i = T_init
+    old_time = time.time()
+
+    # Run NVT steps in JIT loop
+    carry_init = (current_state, current_nbrs, current_box, temp_i)
+    new_state, new_nbrs, new_box, _ = jax.block_until_ready(
+        jax.lax.fori_loop(0, nvt_steps, step_nvt_fn, carry_init)
     )
 
-    # Stack per-step logs: outs = (T, KE, PE)
-    T_traj, KE_traj, PE_traj = (outs[0], outs[1], outs[2])
+    # Check neighbor overflow
+    if new_nbrs.did_buffer_overflow:
+        print("Neighbor list overflowed, reallocating.")
+        new_nbrs = neighbor_fn.allocate(new_state.position, box=new_box)
 
-    return (state_f, nlist_act_f, nlist_nxt_f, frame_idx_f, frames_f,
-            T_traj, KE_traj, PE_traj)
+    # Accept new state
+    current_state = new_state
+    current_nbrs = new_nbrs
+    current_box = new_box
 
-print("Compiling & running fused trajectory ...")
-(state, nlist_active, nlist_next, frame_idx, frames,
- T_traj, KE_traj, PE_traj) = run_simulation(state, nlist_active, nlist_next)
+    # --- Diagnostics ---
+    KE = kinetic_energy(momentum=current_state.momentum, mass=current_state.mass)
+    PE = potential_energy_fn(current_state.position, current_nbrs)
+    T_inst = temperature_fn(momentum=current_state.momentum, mass=current_state.mass) / unit['temperature']
 
-# Compute initial and final energies (optional; small extra work)
-R_final = state.position
-E_final, _ = energy_grad_fn(R_final, nlist_active)
+    steps_done = cycle * nvt_steps
+    time_per_step = (time.time() - old_time) / nvt_steps
 
-# =========================
-# 3) Single host transfer & I/O after the run
-# =========================
-trajectory_xyz_file = "trajectory.xyz"
-thermo_file = "thermo.csv"
-for f in [trajectory_xyz_file, thermo_file]:
-    if os.path.exists(f):
-        os.remove(f)
+    print(f"{steps_done}\t{KE:.2f}\t{PE:.2f}\t{(KE+PE):.3f}\t{T_inst:.1f}\t{time_per_step:.4f}")
 
-# Move data to host once
-frames_np = np.array(frames[:int(frame_idx)])   # (n_written, N, 3)
-kT_np     = np.array(T_traj)
-KE_np     = np.array(KE_traj)
-PE_np     = np.array(PE_traj)
+    # --- LAMMPS-style dump ---
+    if steps_done % write_every == 0:
+        f = dump_file
+        f.write(f"ITEM: TIMESTEP\n{steps_done}\n")
+        f.write(f"ITEM: NUMBER OF ATOMS\n{n_atoms}\n")
+        f.write(f"ITEM: BOX BOUNDS pp pp pp\n")
+        # Handle both 1D (orthorhombic) and 2D (triclinic) cases
+        box_arr = np.array(current_box)
 
-# Save trajectory
-with open(trajectory_xyz_file, "w") as f:
-    for frame in frames_np:
-        f.write(f"{frame.shape[0]}\n")
-        f.write("Generated by JAX MD simulation\n")
-        for atom_type, pos in zip(atom_types, frame):
-            f.write(f"{atom_type} {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}\n")
+        if box_arr.ndim == 1:
+        # Orthorhombic: [Lx, Ly, Lz]
+          f.write(f"0 {box_arr[0]}\n")
+          f.write(f"0 {box_arr[1]}\n")
+          f.write(f"0 {box_arr[2]}\n")
+        elif box_arr.ndim == 2:
+        # Triclinic: use diagonal as lengths
+          f.write(f"0 {box_arr[0,0]}\n")
+          f.write(f"0 {box_arr[1,1]}\n")
+          f.write(f"0 {box_arr[2,2]}\n")
+        else:
+          raise ValueError(f"Unexpected box shape: {box_arr.shape}")
 
-# Save thermo
-import pandas as pd
-df = pd.DataFrame({
-    "step": np.arange(steps, dtype=int),
-    "kT": kT_np,
-    "KE": KE_np,
-    "PE": PE_np,
-})
-df.to_csv(thermo_file, index=False)
 
-print(f"Total final potential : {np.array(E_final):.6f} kcal/mol")
-print(f"Trajectory saved to {trajectory_xyz_file}, thermo data saved to {thermo_file}")
+        f.write("ITEM: ATOMS id type mass x y z xu yu zu\n")
+
+        pos_wrapped = np.array(current_state.position)
+        pos_unwrapped = pos_wrapped  # replace with actual unwrapped if available
+
+        for i in range(n_atoms):
+            f.write(f"{atom_ids[i]} {atom_types_np[i]} {masses_np[i]} "
+                    f"{pos_wrapped[i,0]:.6f} {pos_wrapped[i,1]:.6f} {pos_wrapped[i,2]:.6f} "
+                    f"{pos_unwrapped[i,0]:.6f} {pos_unwrapped[i,1]:.6f} {pos_unwrapped[i,2]:.6f}\n")
+
+# --- Close dump file ---
+dump_file.close()
+print("Total simulation time: ", time.time() - total_time_start)
+jax.clear_caches()

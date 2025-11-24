@@ -7,9 +7,10 @@ from jax_md.mm_forcefields import oplsaa
 from jax_md.mm_forcefields.nonbonded.electrostatics import CutoffCoulomb
 from jax_md.mm_forcefields.base import NonbondedOptions, Topology
 from jax_md.mm_forcefields.oplsaa.params import Parameters
+from jax_md.mm_forcefields import neighbor
 
 from extract_params_oplsaa import parse_lammps_data
-from modular_Ewald import make_is_14_lookup
+
 
 # === Load system from LAMMPS files ===
 positions, bonds, angles, torsions, impropers, nonbonded, molecule_id, box, masses, atom_types = parse_lammps_data(
@@ -32,24 +33,22 @@ neighbor_fn = partition.neighbor_list(displacement_fn, box, r_cutoff=cut_off_rad
 nlist_init = neighbor_fn.allocate(positions)
 
 # === Exclusions and 1-4 mask ===
-same_mol_mask = molecule_id[:, None] == molecule_id[None, :]
+#build exclusion list for non-bonded interactions
+exclusion_mask = neighbor.make_exclusion_mask(
+    n_atoms,
+    bond_idx,      # shape [n_bonds, 2]
+    angle_idx,     # shape [n_angles, 3]
+    molecule_id    # shape [n_atoms]
+)
 
-# Initialize masks
-exclusion_mask = jnp.zeros((n_atoms, n_atoms), dtype=bool)
-pair_14_mask = make_is_14_lookup(pair_indices, is_14_mask, n_atoms)
+# Build 1-4 interaction table for scaling
 
-# Apply bond and angle exclusions only for same molecule
-bond_same_mol = molecule_id[bond_idx[:, 0]] == molecule_id[bond_idx[:, 1]]
-angle_same_mol = molecule_id[angle_idx[:, 0]] == molecule_id[angle_idx[:, 2]]
-
-bond_idx_filtered = bond_idx[bond_same_mol]
-angle_idx_filtered = angle_idx[angle_same_mol]
-
-exclusion_mask = exclusion_mask.at[bond_idx_filtered[:, 0], bond_idx_filtered[:, 1]].set(True)
-exclusion_mask = exclusion_mask.at[bond_idx_filtered[:, 1], bond_idx_filtered[:, 0]].set(True)
-
-exclusion_mask = exclusion_mask.at[angle_idx_filtered[:, 0], angle_idx_filtered[:, 2]].set(True)
-exclusion_mask = exclusion_mask.at[angle_idx_filtered[:, 2], angle_idx_filtered[:, 0]].set(True)
+pair_14_mask = neighbor.make_14_table(
+    n_atoms,
+    torsions[0],       # torsions[0] should be torsion indices, shape [n_torsions, 4]
+    exclusion_mask,
+    molecule_id
+)
 
 # === Topology ===
 topo = Topology(
